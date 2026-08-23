@@ -1,3 +1,4 @@
+
 import streamlit as st
 import json
 import requests
@@ -32,12 +33,20 @@ def fetch_live_mandi_data(state="Maharashtra", district="Mumbai", limit=1000):
         "filters[state]": state,
         "filters[district]": district,
     }
-    response = requests.get(url, params=params, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-    records = data.get("records", [])
-    df = pd.DataFrame(records)
-    return df
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            records = data.get("records", [])
+            return pd.DataFrame(records)
+        except Exception as e:
+            last_error = e
+            continue
+    # All 3 attempts failed — signal failure to caller, don't crash the app
+    st.session_state["live_fetch_failed"] = str(last_error)
+    return pd.DataFrame()
  
 def clean_live_data(df):
     if df.empty:
@@ -60,33 +69,39 @@ def row_to_text(row):
     )
  
 # ---------------------------------------------------------
-# LOAD PM-KISAN CHUNKS (still static — this is a policy document, not live data)
+# LOAD ALL SAVED STATIC CHUNKS (used for PM-KISAN always, and as fallback for prices)
 # ---------------------------------------------------------
 @st.cache_resource
-def load_policy_chunks():
+def load_static_chunks():
     with open('embeddings/all_chunks.json', 'r') as f:
         all_chunks = json.load(f)
     with open('embeddings/chunk_sources.json', 'r') as f:
         chunk_sources = json.load(f)
-    # Keep only the PM-KISAN (pdf) chunks from the saved file; price chunks now come live
     policy_chunks = [c for c, s in zip(all_chunks, chunk_sources) if s == "pmkisan_pdf"]
-    policy_sources = ["pmkisan_pdf"] * len(policy_chunks)
-    return policy_chunks, policy_sources
+    static_price_chunks = [c for c, s in zip(all_chunks, chunk_sources) if s == "mandi_prices_csv"]
+    return policy_chunks, static_price_chunks
  
 # ---------------------------------------------------------
-# BUILD COMBINED, LIVE TF-IDF INDEX
+# BUILD COMBINED, LIVE (with static fallback) TF-IDF INDEX
 # ---------------------------------------------------------
 @st.cache_resource(ttl=3600)
 def build_index():
+    policy_chunks, static_price_chunks = load_static_chunks()
+ 
     live_df = fetch_live_mandi_data()
     live_df = clean_live_data(live_df)
  
-    price_chunks = []
     if not live_df.empty:
         price_chunks = live_df.apply(row_to_text, axis=1).tolist()
-    price_sources = ["mandi_prices_live_api"] * len(price_chunks)
+        price_sources = ["mandi_prices_live_api"] * len(price_chunks)
+        data_mode = "live"
+    else:
+        # Live API failed or returned nothing — fall back to last known good data
+        price_chunks = static_price_chunks
+        price_sources = ["mandi_prices_static_fallback"] * len(price_chunks)
+        data_mode = "fallback"
  
-    policy_chunks, policy_sources = load_policy_chunks()
+    policy_sources = ["pmkisan_pdf"] * len(policy_chunks)
  
     all_chunks = price_chunks + policy_chunks
     chunk_sources = price_sources + policy_sources
@@ -94,9 +109,9 @@ def build_index():
     vectorizer = TfidfVectorizer(stop_words='english', max_features=5000)
     tfidf_matrix = vectorizer.fit_transform(all_chunks) if all_chunks else None
  
-    return all_chunks, chunk_sources, vectorizer, tfidf_matrix, len(price_chunks)
+    return all_chunks, chunk_sources, vectorizer, tfidf_matrix, len(price_chunks), data_mode
  
-all_chunks, chunk_sources, vectorizer, tfidf_matrix, live_count = build_index()
+all_chunks, chunk_sources, vectorizer, tfidf_matrix, live_count, data_mode = build_index()
  
 # ---------------------------------------------------------
 # GROQ CLIENT
@@ -153,11 +168,15 @@ with st.sidebar:
     st.title("🌾 About")
     st.write(
         "This assistant answers questions about **Mumbai APMC mandi prices** "
-        "(fetched live from the AGMARKNET / data.gov.in API) and the **PM-KISAN scheme**."
+        "(fetched live from the AGMARKNET / data.gov.in API, with a static fallback for reliability) "
+        "and the **PM-KISAN scheme**."
     )
-    st.write(f"**Live price records loaded:** {live_count}")
+    if data_mode == "live":
+        st.success(f"🟢 Live data active — {live_count} price records")
+    else:
+        st.warning(f"🟡 Live API unavailable — using last saved data ({live_count} records)")
     st.write("**Data sources:**")
-    st.write("- AGMARKNET (data.gov.in) — live API")
+    st.write("- AGMARKNET (data.gov.in) — live API, static fallback")
     st.write("- PM-KISAN Operational Guidelines (PDF)")
  
     st.divider()
@@ -223,4 +242,3 @@ if len(st.session_state.messages) == 0:
         st.info("Compare tomato and potato prices")
     with col3:
         st.info("What is PM-KISAN scheme?")
- 
